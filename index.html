@@ -382,7 +382,7 @@
       return `
       <div class="loading-wrap">
         <div class="loading-card"></div>
-        <p>LENDO O MATERIAL E MONTANDO OS CARTÕES…</p>
+        <p>ANALISANDO O TEXTO E MONTANDO OS CARTÕES…</p>
       </div>`;
     }
 
@@ -393,9 +393,9 @@
     return `
       <button class="back-link" id="back-home">&larr; baralhos</button>
       <h2 class="title">Novo baralho</h2>
-      <p class="subtitle">Envie um documento ou cole um texto. Eu identifico os pontos principais e crio os flashcards para você revisar antes de salvar.</p>
+      <p class="subtitle">Envie um documento ou cole um texto. Eu identifico os pontos principais e crio os flashcards para você revisar antes de salvar — de graça, direto no navegador.</p>
 
-      ${!settings.apiKey ? `<div class="error-box" style="background:rgba(212,165,116,0.12); border-color:rgba(212,165,116,0.4); color:var(--gold-bright);">Nenhuma chave de API configurada. Se a geração falhar com "Failed to fetch", adicione sua chave em <button id="goto-settings-inline" style="background:none;border:none;color:var(--gold-bright);text-decoration:underline;cursor:pointer;padding:0;font:inherit;">Configurações</button>.</div>` : ''}
+      ${settings.apiKey ? `<div class="error-box" style="background:rgba(79,174,142,0.1); border-color:rgba(79,174,142,0.4); color:#8fd9be;">Modo com IA ativado (usando sua chave de API). Cartões mais elaborados, com custo por geração.</div>` : ''}
 
       <div class="tab-switch">
         <button data-mode="file" class="${importState.mode==='file'?'active':''}">Arquivo</button>
@@ -475,7 +475,7 @@
     return `
       <button class="back-link" id="back-home">&larr; baralhos</button>
       <h2 class="title">Configurações</h2>
-      <p class="subtitle">Para gerar flashcards com IA fora do preview do Claude, cole aqui sua chave de API da Anthropic. Ela fica salva só neste navegador e é usada apenas para chamar a API diretamente — nunca é enviada para mais nenhum lugar.</p>
+      <p class="subtitle">O app já gera flashcards de graça, direto no navegador, sem precisar de nada aqui. Se um dia você quiser cartões com um toque mais elaborado (geração por IA), pode colar uma chave de API da Anthropic abaixo — nesse caso, o uso é cobrado por lá conforme a quantidade de texto processado (poucos centavos por baralho). Sem chave, tudo continua funcionando normalmente.</p>
 
       <label class="field-label">Chave de API (começa com sk-ant-...)</label>
       <input type="text" id="api-key-input" placeholder="sk-ant-..." value="${escapeHtml(settings.apiKey || '')}" autocomplete="off" spellcheck="false">
@@ -674,11 +674,106 @@
     return result.value;
   }
 
-  /* ---------------- AI generation ---------------- */
+  /* ---------------- Free local generator (no API needed) ---------------- */
+  const STOPWORDS = new Set(("a o os as um uma uns umas de do da dos das em no na nos nas por para com sem sob sobre entre até desde após ante " +
+    "e ou mas que se não sim é são foi foram ser estar tem têm há como quando onde qual quais este esta estes estas esse essa esses essas " +
+    "isso isto aquele aquela aquilo seu sua seus suas meu minha meus minhas nosso nossa nossos nossas dele dela deles delas " +
+    "mais menos muito muita muitos muitas pouco pouca poucos poucas também já ainda apenas só bem mal assim então logo pois porque porquê " +
+    "ao aos à às pela pelo pelas pelos num numa nele nela isto aquilo cada todo toda todos todas outro outra outros outras qualquer quaisquer " +
+    "the of and to in a is are was were be been being this that these those it its as an").split(' '));
+
+  function splitSentences(text){
+    return text
+      .replace(/\s+/g, ' ')
+      .split(/(?<=[.!?;])\s+(?=[A-ZÀ-Ú0-9])/)
+      .map(s=>s.trim())
+      .filter(s=> s.length >= 25 && s.length <= 300 && /[a-zA-ZÀ-ÿ]/.test(s));
+  }
+
+  function wordFreq(sentences){
+    const freq = {};
+    sentences.forEach(s=>{
+      const words = s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').match(/[a-z0-9]{4,}/g) || [];
+      words.forEach(w=>{
+        if(STOPWORDS.has(w)) return;
+        freq[w] = (freq[w]||0) + 1;
+      });
+    });
+    return freq;
+  }
+
+  function generateFlashcardsLocal(text, count){
+    const sentences = splitSentences(text);
+    if(sentences.length === 0) return [];
+    const freq = wordFreq(sentences);
+
+    const defMarkers = [' é ', ' são ', ' significa ', ' consiste em ', ' refere-se a ', ' se refere a ', ' corresponde a ', ' pode ser definido como ', ' trata-se de '];
+
+    const scored = sentences.map((s, idx)=>{
+      const words = s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').match(/[a-z0-9]{4,}/g) || [];
+      let score = words.reduce((acc,w)=> acc + (STOPWORDS.has(w) ? 0 : (freq[w]||0)), 0) / Math.max(words.length,1);
+      const isDef = defMarkers.some(m=> s.toLowerCase().includes(m));
+      if(isDef) score += 2;
+      if(/^\s*[-•\d]/.test(s)) score += 0.5;
+      return { s, idx, score, isDef };
+    }).sort((a,b)=> b.score - a.score);
+
+    const chosen = scored.slice(0, Math.min(count*2, scored.length));
+    const cardsOut = [];
+    const seenFronts = new Set();
+
+    for(const item of chosen){
+      if(cardsOut.length >= count) break;
+      const s = item.s;
+      let front=null, back=null;
+
+      if(item.isDef){
+        for(const m of defMarkers){
+          const i = s.toLowerCase().indexOf(m);
+          if(i > 3){
+            let term = s.slice(0, i).trim().replace(/^[-•\d.\s]+/, '');
+            term = term.replace(/^(a|o|as|os|A|O|As|Os)\s+/, '');
+            const rest = s.slice(i + m.length).trim();
+            if(term.length>=2 && term.length<=70 && rest.length>=8){
+              const verb = m.trim()==='são' ? 'são' : 'é';
+              front = `O que ${verb} "${term}"?`;
+              back = rest.replace(/\.$/, '.');
+            }
+            break;
+          }
+        }
+      }
+
+      if(!front){
+        // cloze deletion: blank the highest-frequency meaningful word in the sentence
+        const wordsInSentence = s.match(/[A-Za-zÀ-ÿ0-9]{4,}/g) || [];
+        let bestWord = null, bestScore = -1;
+        wordsInSentence.forEach(w=>{
+          const norm = w.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+          if(STOPWORDS.has(norm)) return;
+          const sc = freq[norm]||0;
+          if(sc > bestScore){ bestScore = sc; bestWord = w; }
+        });
+        if(bestWord){
+          const re = new RegExp('\\b' + bestWord.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\b');
+          front = s.replace(re, '_____');
+          back = bestWord;
+        }
+      }
+
+      if(front && back && !seenFronts.has(front)){
+        seenFronts.add(front);
+        cardsOut.push({ front, back });
+      }
+    }
+    return cardsOut;
+  }
+
+  /* ---------------- Flashcard generation (free local, or AI if a key is set) ---------------- */
   async function generateFlashcards(){
-    const sourceText = importState.mode === 'paste' ? importState.extractedText : importState.extractedText;
-    if(!sourceText || sourceText.trim().length < 30){
-      importState.genError = 'Adicione um texto ou arquivo com conteúdo suficiente para gerar os cartões.';
+    const sourceText = importState.extractedText;
+    if(!sourceText || sourceText.trim().length < 80){
+      importState.genError = 'Adicione um texto ou arquivo com conteúdo suficiente para gerar os cartões (pelo menos um parágrafo).';
       render();
       return;
     }
@@ -686,9 +781,30 @@
     importState.genError = null;
     render();
 
-    const truncated = sourceText.slice(0, 18000);
     const n = importState.count;
 
+    if(!settings.apiKey){
+      // Free, fully offline path — no network call, no cost.
+      await new Promise(r=>setTimeout(r, 350)); // let the loading state paint
+      try{
+        const localCards = generateFlashcardsLocal(sourceText, n);
+        if(localCards.length === 0){
+          throw new Error('Não consegui identificar pontos suficientes nesse texto. Tente colar um trecho mais longo ou com frases mais completas.');
+        }
+        importState.generated = localCards.map(c=>({ id: uid(), front: c.front, back: c.back, include: true }));
+        if(!importState.deckName) importState.deckName = 'Novo baralho';
+      }catch(e){
+        importState.genError = e.message;
+        importState.generated = null;
+      }finally{
+        importState.generating = false;
+        render();
+      }
+      return;
+    }
+
+    // Optional higher-quality path using the user's own Anthropic API key
+    const truncated = sourceText.slice(0, 18000);
     const sys = `Você é um assistente que cria flashcards de estudo de alta qualidade a partir de um material. ` +
       `Identifique os conceitos, definições, fatos e relações mais importantes do texto — o que realmente importa para revisar antes de uma prova. ` +
       `Gere exatamente ${n} flashcards. Cada flashcard deve ter uma frente ("front": uma pergunta clara e específica, ou um termo) e um verso ("back": a resposta, curta e precisa, no máximo 2-3 frases). ` +
@@ -696,12 +812,12 @@
       `Responda APENAS com um array JSON válido, sem markdown, sem texto antes ou depois, no formato: ` +
       `[{"front":"...","back":"..."}, ...]`;
 
-    const headers = { "Content-Type": "application/json" };
-    if(settings.apiKey){
-      headers["x-api-key"] = settings.apiKey;
-      headers["anthropic-version"] = "2023-06-01";
-      headers["anthropic-dangerous-direct-browser-access"] = "true";
-    }
+    const headers = {
+      "Content-Type": "application/json",
+      "x-api-key": settings.apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    };
 
     try{
       let response;
@@ -719,16 +835,13 @@
           })
         });
       }catch(networkErr){
-        if(!settings.apiKey){
-          throw new Error('Não consegui conectar ao serviço de IA. Se você está usando o app fora do preview do Claude, adicione sua chave de API em Configurações (ícone de engrenagem).');
-        }
-        throw new Error('Não consegui conectar ao serviço de IA. Verifique sua internet e tente de novo.');
+        throw new Error('Não consegui conectar ao serviço de IA. Verifique sua internet e tente de novo, ou remova a chave em Configurações para usar o modo gratuito.');
       }
       if(!response.ok){
         let detail = '';
         try{ const errBody = await response.json(); detail = errBody?.error?.message || ''; }catch(e){}
         if(response.status === 401){
-          throw new Error('Chave de API inválida ou ausente. Verifique em Configurações.');
+          throw new Error('Chave de API inválida. Verifique em Configurações, ou remova-a para usar o modo gratuito.');
         }
         throw new Error(detail || 'O serviço de geração retornou um erro. Tente novamente em instantes.');
       }
